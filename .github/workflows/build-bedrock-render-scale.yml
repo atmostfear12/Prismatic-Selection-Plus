@@ -1,0 +1,55 @@
+name: Build BedrockRenderScale
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Render scale (0.50 = half width and height)"
+        required: true
+        default: "0.50"
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout tweak branch
+        uses: actions/checkout@v4
+        with:
+          ref: bedrock-render-scale
+
+      - name: Build arm64 iOS dylib
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SCALE="${{ github.event.inputs.scale }}"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p build
+
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -fobjc-arc \
+            -O2 \
+            -miphoneos-version-min=15.0 \
+            -isysroot "$SDK" \
+            -DBEDROCK_RENDER_SCALE="$SCALE" \
+            -framework Foundation \
+            -framework QuartzCore \
+            -framework Metal \
+            -install_name "@rpath/BedrockRenderScale.dylib" \
+            bedrock-render-scale/Tweak.m \
+            -o build/BedrockRenderScale.dylib
+
+          file build/BedrockRenderScale.dylib
+          otool -L build/BedrockRenderScale.dylib
+
+      - name: Ad-hoc sign dylib
+        run: codesign --force --sign - build/BedrockRenderScale.dylib
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: BedrockRenderScale-${{ github.event.inputs.scale }}
+          path: build/BedrockRenderScale.dylib
+          if-no-files-found: error
