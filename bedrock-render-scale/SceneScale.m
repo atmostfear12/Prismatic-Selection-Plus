@@ -21,6 +21,7 @@ static IMP gOriginalSetScissorRect = NULL;
 static IMP gOriginalSetScissorRects = NULL;
 static IMP gOriginalNewRenderPipeline = NULL;
 static IMP gOriginalTextureGetBytes = NULL;
+static IMP gOriginalTextureGetBytesFull = NULL;
 static IMP gOriginalLabelSetText = NULL;
 
 static BOOL gEnabledForDevice = NO;
@@ -192,50 +193,82 @@ static void BRS_setScissorRects(id self, SEL _cmd, const MTLScissorRect *rects, 
     ((void(*)(id, SEL, const MTLScissorRect *, NSUInteger))gOriginalSetScissorRects)(self, _cmd, local, count);
 }
 
-// Correct native-size CPU readback of a scene-scaled RGBA8 target. Minecraft
-// uses a readback when creating the world-list screenshot. Without this bridge,
-// native row geometry can be applied to the 0.66 target and create striping.
-static void BRS_getBytes(id self, SEL _cmd, void *pixelBytes, NSUInteger bytesPerRow,
-                         MTLRegion region, NSUInteger level) {
-    if (!gOriginalTextureGetBytes || !pixelBytes || !BRSTextureWasPatched((id<MTLTexture>)self) || level != 0) {
-        ((void(*)(id, SEL, void *, NSUInteger, MTLRegion, NSUInteger))gOriginalTextureGetBytes)(self, _cmd, pixelBytes, bytesPerRow, region, level);
-        return;
-    }
-
-    id<MTLTexture> tex = (id<MTLTexture>)self;
+static BOOL BRSCanBridgeReadback(id<MTLTexture> tex, void *pixelBytes, NSUInteger bytesPerRow,
+                                 MTLRegion region, NSUInteger level) {
+    if (!pixelBytes || !BRSTextureWasPatched(tex) || level != 0 || !tex) return NO;
     BOOL nativeRequest = BRSIsNativeSize(region.size.width, region.size.height) &&
                          region.origin.x == 0 && region.origin.y == 0 && region.origin.z == 0 &&
                          region.size.depth == 1;
     BOOL isRGBA8 = (tex.pixelFormat == MTLPixelFormatRGBA8Unorm || tex.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB ||
                     tex.pixelFormat == MTLPixelFormatBGRA8Unorm || tex.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB);
+    return nativeRequest && isRGBA8 && bytesPerRow >= region.size.width * 4 && tex.width > 0 && tex.height > 0;
+}
 
-    if (!nativeRequest || !isRGBA8 || bytesPerRow < region.size.width * 4 || tex.width == 0 || tex.height == 0) {
-        ((void(*)(id, SEL, void *, NSUInteger, MTLRegion, NSUInteger))gOriginalTextureGetBytes)(self, _cmd, pixelBytes, bytesPerRow, region, level);
-        return;
-    }
-
-    const NSUInteger srcW = tex.width;
-    const NSUInteger srcH = tex.height;
-    const NSUInteger srcRow = srcW * 4;
-    const size_t tempSize = (size_t)srcRow * (size_t)srcH;
-    uint8_t *temp = (uint8_t *)malloc(tempSize);
-    if (!temp) return;
-
-    MTLRegion srcRegion = MTLRegionMake2D(0, 0, srcW, srcH);
-    ((void(*)(id, SEL, void *, NSUInteger, MTLRegion, NSUInteger))gOriginalTextureGetBytes)(self, _cmd, temp, srcRow, srcRegion, level);
-
-    const NSUInteger dstW = region.size.width;
-    const NSUInteger dstH = region.size.height;
+static void BRSUpscaleReadbackRGBA8(const uint8_t *src, NSUInteger srcW, NSUInteger srcH, NSUInteger srcRow,
+                                    void *pixelBytes, NSUInteger bytesPerRow, NSUInteger dstW, NSUInteger dstH) {
     uint8_t *dst = (uint8_t *)pixelBytes;
     for (NSUInteger y = 0; y < dstH; y++) {
         NSUInteger sy = MIN(srcH - 1, (NSUInteger)(((uint64_t)y * srcH) / dstH));
         uint8_t *dstRow = dst + (size_t)y * bytesPerRow;
-        const uint8_t *srcRowPtr = temp + (size_t)sy * srcRow;
+        const uint8_t *srcRowPtr = src + (size_t)sy * srcRow;
         for (NSUInteger x = 0; x < dstW; x++) {
             NSUInteger sx = MIN(srcW - 1, (NSUInteger)(((uint64_t)x * srcW) / dstW));
             memcpy(dstRow + (size_t)x * 4, srcRowPtr + (size_t)sx * 4, 4);
         }
     }
+}
+
+// Bridge the short Metal CPU-readback selector used by some screenshot paths.
+static void BRS_getBytes(id self, SEL _cmd, void *pixelBytes, NSUInteger bytesPerRow,
+                         MTLRegion region, NSUInteger level) {
+    if (!gOriginalTextureGetBytes || !BRSCanBridgeReadback((id<MTLTexture>)self, pixelBytes, bytesPerRow, region, level)) {
+        ((void(*)(id, SEL, void *, NSUInteger, MTLRegion, NSUInteger))gOriginalTextureGetBytes)(self, _cmd, pixelBytes, bytesPerRow, region, level);
+        return;
+    }
+
+    id<MTLTexture> tex = (id<MTLTexture>)self;
+    const NSUInteger srcW = tex.width;
+    const NSUInteger srcH = tex.height;
+    const NSUInteger srcRow = srcW * 4;
+    const size_t tempSize = (size_t)srcRow * (size_t)srcH;
+    uint8_t *temp = (uint8_t *)malloc(tempSize);
+    if (!temp) {
+        ((void(*)(id, SEL, void *, NSUInteger, MTLRegion, NSUInteger))gOriginalTextureGetBytes)(self, _cmd, pixelBytes, bytesPerRow, region, level);
+        return;
+    }
+
+    MTLRegion srcRegion = MTLRegionMake2D(0, 0, srcW, srcH);
+    ((void(*)(id, SEL, void *, NSUInteger, MTLRegion, NSUInteger))gOriginalTextureGetBytes)(self, _cmd, temp, srcRow, srcRegion, level);
+    BRSUpscaleReadbackRGBA8(temp, srcW, srcH, srcRow, pixelBytes, bytesPerRow, region.size.width, region.size.height);
+    free(temp);
+}
+
+// Bridge the extended Metal CPU-readback selector. Bedrock's world-thumbnail path
+// can use this form, which was not covered by v6 and left the preview striped.
+static void BRS_getBytesFull(id self, SEL _cmd, void *pixelBytes, NSUInteger bytesPerRow,
+                             NSUInteger bytesPerImage, MTLRegion region, NSUInteger level,
+                             NSUInteger slice) {
+    if (!gOriginalTextureGetBytesFull || slice != 0 ||
+        !BRSCanBridgeReadback((id<MTLTexture>)self, pixelBytes, bytesPerRow, region, level)) {
+        ((void(*)(id, SEL, void *, NSUInteger, NSUInteger, MTLRegion, NSUInteger, NSUInteger))gOriginalTextureGetBytesFull)(self, _cmd, pixelBytes, bytesPerRow, bytesPerImage, region, level, slice);
+        return;
+    }
+
+    id<MTLTexture> tex = (id<MTLTexture>)self;
+    const NSUInteger srcW = tex.width;
+    const NSUInteger srcH = tex.height;
+    const NSUInteger srcRow = srcW * 4;
+    const NSUInteger srcImage = srcRow * srcH;
+    const size_t tempSize = (size_t)srcImage;
+    uint8_t *temp = (uint8_t *)malloc(tempSize);
+    if (!temp) {
+        ((void(*)(id, SEL, void *, NSUInteger, NSUInteger, MTLRegion, NSUInteger, NSUInteger))gOriginalTextureGetBytesFull)(self, _cmd, pixelBytes, bytesPerRow, bytesPerImage, region, level, slice);
+        return;
+    }
+
+    MTLRegion srcRegion = MTLRegionMake2D(0, 0, srcW, srcH);
+    ((void(*)(id, SEL, void *, NSUInteger, NSUInteger, MTLRegion, NSUInteger, NSUInteger))gOriginalTextureGetBytesFull)(self, _cmd, temp, srcRow, srcImage, srcRegion, level, slice);
+    BRSUpscaleReadbackRGBA8(temp, srcW, srcH, srcRow, pixelBytes, bytesPerRow, region.size.width, region.size.height);
     free(temp);
 }
 
@@ -290,6 +323,12 @@ static BOOL BRSInstallEncoderHooks(id<MTLDevice> device) {
                                @selector(getBytes:bytesPerRow:fromRegion:mipmapLevel:),
                                (IMP)BRS_getBytes,
                                &gOriginalTextureGetBytes);
+    }
+    if (class_getInstanceMethod(textureClass, @selector(getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:))) {
+        BRSInstallInstanceHook(textureClass,
+                               @selector(getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:),
+                               (IMP)BRS_getBytesFull,
+                               &gOriginalTextureGetBytesFull);
     }
 
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
