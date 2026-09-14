@@ -1,5 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <sys/utsname.h>
 #import <math.h>
@@ -18,13 +20,16 @@ static IMP gOriginalSetViewport = NULL;
 static IMP gOriginalSetViewports = NULL;
 static IMP gOriginalSetScissorRect = NULL;
 static IMP gOriginalSetScissorRects = NULL;
+static IMP gOriginalSetDrawableSize = NULL;
 
 static NSString *gLogPath = nil;
 static BOOL gEnabledForDevice = NO;
 static NSUInteger gPatchCount = 0;
 static NSUInteger gViewportPatchCount = 0;
 static NSUInteger gScissorPatchCount = 0;
-static NSHashTable *gPatchedTextures = nil;
+static NSUInteger gLayerTuneCount = 0;
+
+static char kBRSPatchedTextureKey;
 static char kBRSPatchedEncoderKey;
 
 static NSString *BRSDeviceModel(void) {
@@ -35,17 +40,15 @@ static NSString *BRSDeviceModel(void) {
 
 static void BRSLog(NSString *line) {
     if (!line || !gLogPath) return;
-    @synchronized ([NSFileManager class]) {
-        NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
-        if (!fh) {
-            [[NSFileManager defaultManager] createFileAtPath:gLogPath contents:data attributes:nil];
-            return;
-        }
-        [fh seekToEndOfFile];
-        [fh writeData:data];
-        [fh closeFile];
+    NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:gLogPath contents:data attributes:nil];
+        return;
     }
+    [fh seekToEndOfFile];
+    [fh writeData:data];
+    [fh closeFile];
 }
 
 static BOOL BRSIsKnownRenderTargetFormat(MTLPixelFormat pf) {
@@ -95,7 +98,6 @@ static BOOL BRSNear(double a, double b) {
 
 static BOOL BRSAdjustViewport(MTLViewport *v) {
     if (!v) return NO;
-
     BOOL landscape = BRSNear(v->width, (double)kNativeW) && BRSNear(v->height, (double)kNativeH);
     BOOL portrait = BRSNear(v->width, (double)kNativeH) && BRSNear(v->height, (double)kNativeW);
     if (!landscape && !portrait) return NO;
@@ -109,7 +111,6 @@ static BOOL BRSAdjustViewport(MTLViewport *v) {
 
 static BOOL BRSAdjustScissor(MTLScissorRect *r) {
     if (!r) return NO;
-
     BOOL landscape = (r->width == kNativeW && r->height == kNativeH);
     BOOL portrait = (r->width == kNativeH && r->height == kNativeW);
     if (!landscape && !portrait) return NO;
@@ -121,27 +122,20 @@ static BOOL BRSAdjustScissor(MTLScissorRect *r) {
     return YES;
 }
 
-static BOOL BRSEncoderIsPatched(id encoder) {
-    return [objc_getAssociatedObject(encoder, &kBRSPatchedEncoderKey) boolValue];
+static inline BOOL BRSTextureWasPatched(id<MTLTexture> texture) {
+    return texture && (objc_getAssociatedObject(texture, &kBRSPatchedTextureKey) != nil);
 }
 
-static BOOL BRSTextureWasPatched(id<MTLTexture> texture) {
-    if (!texture || !gPatchedTextures) return NO;
-    @synchronized (gPatchedTextures) {
-        return [gPatchedTextures containsObject:texture];
-    }
+static inline BOOL BRSEncoderIsPatched(id encoder) {
+    return encoder && (objc_getAssociatedObject(encoder, &kBRSPatchedEncoderKey) != nil);
 }
 
 static BOOL BRSRenderPassUsesPatchedTexture(MTLRenderPassDescriptor *descriptor) {
     if (!descriptor) return NO;
-
     for (NSUInteger i = 0; i < 8; i++) {
-        MTLRenderPassColorAttachmentDescriptor *attachment = [descriptor.colorAttachments objectAtIndexedSubscript:i];
-        if (BRSTextureWasPatched(attachment.texture) || BRSTextureWasPatched(attachment.resolveTexture)) {
-            return YES;
-        }
+        MTLRenderPassColorAttachmentDescriptor *a = descriptor.colorAttachments[i];
+        if (BRSTextureWasPatched(a.texture) || BRSTextureWasPatched(a.resolveTexture)) return YES;
     }
-
     if (BRSTextureWasPatched(descriptor.depthAttachment.texture)) return YES;
     if (BRSTextureWasPatched(descriptor.stencilAttachment.texture)) return YES;
     return NO;
@@ -159,26 +153,20 @@ static id BRS_newTextureWithDescriptor(id self, SEL _cmd, MTLTextureDescriptor *
     patched.height = BRSScaledDimension(oldH);
 
     id texture = ((id(*)(id, SEL, MTLTextureDescriptor *))gOriginalNewTexture)(self, _cmd, patched);
-
     if (texture) {
-        @synchronized (gPatchedTextures) {
-            [gPatchedTextures addObject:texture];
-        }
+        objc_setAssociatedObject(texture, &kBRSPatchedTextureKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
     NSUInteger count = ++gPatchCount;
-    if (count <= 128) {
-        BRSLog([NSString stringWithFormat:
-                @"TARGET #%lu %lux%lu -> %lux%lu pf=%lu usage=0x%lx storage=%lu success=%@",
+    if (count <= 24) {
+        BRSLog([NSString stringWithFormat:@"TARGET #%lu %lux%lu -> %lux%lu pf=%lu storage=%lu %@",
                 (unsigned long)count,
                 (unsigned long)oldW, (unsigned long)oldH,
                 (unsigned long)patched.width, (unsigned long)patched.height,
                 (unsigned long)descriptor.pixelFormat,
-                (unsigned long)descriptor.usage,
                 (unsigned long)descriptor.storageMode,
-                texture ? @"YES" : @"NO"]);
+                texture ? @"OK" : @"FAIL"]);
     }
-
     return texture;
 }
 
@@ -194,13 +182,7 @@ static void BRS_setViewport(id self, SEL _cmd, MTLViewport viewport) {
     if (BRSEncoderIsPatched(self)) {
         MTLViewport adjusted = viewport;
         if (BRSAdjustViewport(&adjusted)) {
-            NSUInteger count = ++gViewportPatchCount;
-            if (count <= 128) {
-                BRSLog([NSString stringWithFormat:@"VIEWPORT #%lu %.0fx%.0f -> %.0fx%.0f",
-                        (unsigned long)count,
-                        viewport.width, viewport.height,
-                        adjusted.width, adjusted.height]);
-            }
+            gViewportPatchCount++;
             viewport = adjusted;
         }
     }
@@ -208,36 +190,24 @@ static void BRS_setViewport(id self, SEL _cmd, MTLViewport viewport) {
 }
 
 static void BRS_setViewports(id self, SEL _cmd, const MTLViewport *viewports, NSUInteger count) {
-    if (!BRSEncoderIsPatched(self) || !viewports || count == 0) {
+    if (!BRSEncoderIsPatched(self) || !viewports || count == 0 || count > 16) {
         ((void(*)(id, SEL, const MTLViewport *, NSUInteger))gOriginalSetViewports)(self, _cmd, viewports, count);
         return;
     }
 
-    MTLViewport *copy = malloc(sizeof(MTLViewport) * count);
-    if (!copy) {
-        ((void(*)(id, SEL, const MTLViewport *, NSUInteger))gOriginalSetViewports)(self, _cmd, viewports, count);
-        return;
-    }
-
-    memcpy(copy, viewports, sizeof(MTLViewport) * count);
+    MTLViewport local[16];
+    memcpy(local, viewports, sizeof(MTLViewport) * count);
     for (NSUInteger i = 0; i < count; i++) {
-        BRSAdjustViewport(&copy[i]);
+        if (BRSAdjustViewport(&local[i])) gViewportPatchCount++;
     }
-    ((void(*)(id, SEL, const MTLViewport *, NSUInteger))gOriginalSetViewports)(self, _cmd, copy, count);
-    free(copy);
+    ((void(*)(id, SEL, const MTLViewport *, NSUInteger))gOriginalSetViewports)(self, _cmd, local, count);
 }
 
 static void BRS_setScissorRect(id self, SEL _cmd, MTLScissorRect rect) {
     if (BRSEncoderIsPatched(self)) {
         MTLScissorRect adjusted = rect;
         if (BRSAdjustScissor(&adjusted)) {
-            NSUInteger count = ++gScissorPatchCount;
-            if (count <= 128) {
-                BRSLog([NSString stringWithFormat:@"SCISSOR #%lu %lux%lu -> %lux%lu",
-                        (unsigned long)count,
-                        (unsigned long)rect.width, (unsigned long)rect.height,
-                        (unsigned long)adjusted.width, (unsigned long)adjusted.height]);
-            }
+            gScissorPatchCount++;
             rect = adjusted;
         }
     }
@@ -245,30 +215,41 @@ static void BRS_setScissorRect(id self, SEL _cmd, MTLScissorRect rect) {
 }
 
 static void BRS_setScissorRects(id self, SEL _cmd, const MTLScissorRect *rects, NSUInteger count) {
-    if (!BRSEncoderIsPatched(self) || !rects || count == 0) {
+    if (!BRSEncoderIsPatched(self) || !rects || count == 0 || count > 16) {
         ((void(*)(id, SEL, const MTLScissorRect *, NSUInteger))gOriginalSetScissorRects)(self, _cmd, rects, count);
         return;
     }
 
-    MTLScissorRect *copy = malloc(sizeof(MTLScissorRect) * count);
-    if (!copy) {
-        ((void(*)(id, SEL, const MTLScissorRect *, NSUInteger))gOriginalSetScissorRects)(self, _cmd, rects, count);
-        return;
-    }
-
-    memcpy(copy, rects, sizeof(MTLScissorRect) * count);
+    MTLScissorRect local[16];
+    memcpy(local, rects, sizeof(MTLScissorRect) * count);
     for (NSUInteger i = 0; i < count; i++) {
-        BRSAdjustScissor(&copy[i]);
+        if (BRSAdjustScissor(&local[i])) gScissorPatchCount++;
     }
-    ((void(*)(id, SEL, const MTLScissorRect *, NSUInteger))gOriginalSetScissorRects)(self, _cmd, copy, count);
-    free(copy);
+    ((void(*)(id, SEL, const MTLScissorRect *, NSUInteger))gOriginalSetScissorRects)(self, _cmd, local, count);
+}
+
+static void BRSTuneMetalLayer(CAMetalLayer *layer) {
+    if (!layer || !gEnabledForDevice) return;
+    CGSize s = layer.drawableSize;
+    if (!BRSIsNativeSize((NSUInteger)llround(s.width), (NSUInteger)llround(s.height))) return;
+
+    // Two drawable buffers instead of the common three-buffer queue reduces queued-frame latency.
+    // Keep the drawable itself native resolution; only queue depth changes here.
+    if (@available(iOS 11.2, *)) {
+        if (layer.maximumDrawableCount != 2) layer.maximumDrawableCount = 2;
+    }
+    gLayerTuneCount++;
+}
+
+static void BRS_setDrawableSize(id self, SEL _cmd, CGSize size) {
+    ((void(*)(id, SEL, CGSize))gOriginalSetDrawableSize)(self, _cmd, size);
+    BRSTuneMetalLayer((CAMetalLayer *)self);
 }
 
 static BOOL BRSInstallInstanceHook(Class cls, SEL sel, IMP replacement, IMP *original) {
     if (!cls || !original) return NO;
     Method method = class_getInstanceMethod(cls, sel);
     if (!method) return NO;
-
     *original = method_getImplementation(method);
     const char *types = method_getTypeEncoding(method);
     if (!class_addMethod(cls, sel, replacement, types)) {
@@ -280,96 +261,53 @@ static BOOL BRSInstallInstanceHook(Class cls, SEL sel, IMP replacement, IMP *ori
 
 static BOOL BRSInstallEncoderHooks(id<MTLDevice> device) {
     id<MTLCommandQueue> queue = [device newCommandQueue];
-    if (!queue) {
-        BRSLog(@"ERROR could not create diagnostic command queue");
-        return NO;
-    }
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    if (!queue || !cb) return NO;
 
-    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
-    if (!commandBuffer) {
-        BRSLog(@"ERROR could not create diagnostic command buffer");
-        return NO;
-    }
-
-    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                  width:4
-                                                                                 height:4
-                                                                              mipmapped:NO];
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:4 height:4 mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
-    id<MTLTexture> tempTexture = [device newTextureWithDescriptor:td];
-    if (!tempTexture) {
-        BRSLog(@"ERROR could not create diagnostic texture");
-        return NO;
-    }
+    id<MTLTexture> temp = [device newTextureWithDescriptor:td];
+    if (!temp) return NO;
 
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.colorAttachments[0].texture = tempTexture;
+    rp.colorAttachments[0].texture = temp;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!enc) return NO;
 
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:rp];
-    if (!encoder) {
-        BRSLog(@"ERROR could not create diagnostic render encoder");
-        return NO;
+    Class cbClass = object_getClass(cb);
+    Class encClass = object_getClass(enc);
+    [enc endEncoding];
+
+    BOOL okRender = BRSInstallInstanceHook(cbClass, @selector(renderCommandEncoderWithDescriptor:), (IMP)BRS_renderCommandEncoderWithDescriptor, &gOriginalRenderEncoder);
+    BOOL okViewport = BRSInstallInstanceHook(encClass, @selector(setViewport:), (IMP)BRS_setViewport, &gOriginalSetViewport);
+    BOOL okScissor = BRSInstallInstanceHook(encClass, @selector(setScissorRect:), (IMP)BRS_setScissorRect, &gOriginalSetScissorRect);
+
+    if (class_getInstanceMethod(encClass, @selector(setViewports:count:))) {
+        BRSInstallInstanceHook(encClass, @selector(setViewports:count:), (IMP)BRS_setViewports, &gOriginalSetViewports);
+    }
+    if (class_getInstanceMethod(encClass, @selector(setScissorRects:count:))) {
+        BRSInstallInstanceHook(encClass, @selector(setScissorRects:count:), (IMP)BRS_setScissorRects, &gOriginalSetScissorRects);
     }
 
-    Class commandBufferClass = object_getClass(commandBuffer);
-    Class encoderClass = object_getClass(encoder);
-
-    [encoder endEncoding];
-
-    BOOL okRender = BRSInstallInstanceHook(commandBufferClass,
-                                           @selector(renderCommandEncoderWithDescriptor:),
-                                           (IMP)BRS_renderCommandEncoderWithDescriptor,
-                                           &gOriginalRenderEncoder);
-    BOOL okViewport = BRSInstallInstanceHook(encoderClass,
-                                             @selector(setViewport:),
-                                             (IMP)BRS_setViewport,
-                                             &gOriginalSetViewport);
-    BOOL okScissor = BRSInstallInstanceHook(encoderClass,
-                                            @selector(setScissorRect:),
-                                            (IMP)BRS_setScissorRect,
-                                            &gOriginalSetScissorRect);
-
-    Method mv = class_getInstanceMethod(encoderClass, @selector(setViewports:count:));
-    if (mv) {
-        BRSInstallInstanceHook(encoderClass,
-                               @selector(setViewports:count:),
-                               (IMP)BRS_setViewports,
-                               &gOriginalSetViewports);
-    }
-
-    Method ms = class_getInstanceMethod(encoderClass, @selector(setScissorRects:count:));
-    if (ms) {
-        BRSInstallInstanceHook(encoderClass,
-                               @selector(setScissorRects:count:),
-                               (IMP)BRS_setScissorRects,
-                               &gOriginalSetScissorRects);
-    }
-
-    BRSLog([NSString stringWithFormat:@"ENCODER_HOOK commandBuffer=%@ encoder=%@ render=%@ viewport=%@ scissor=%@",
-            NSStringFromClass(commandBufferClass),
-            NSStringFromClass(encoderClass),
-            okRender ? @"YES" : @"NO",
-            okViewport ? @"YES" : @"NO",
-            okScissor ? @"YES" : @"NO"]);
-
+    BRSLog([NSString stringWithFormat:@"ENCODER_HOOK %@ %@ render=%@ viewport=%@ scissor=%@",
+            NSStringFromClass(cbClass), NSStringFromClass(encClass),
+            okRender ? @"YES" : @"NO", okViewport ? @"YES" : @"NO", okScissor ? @"YES" : @"NO"]);
     return okRender && okViewport && okScissor;
 }
 
 static BOOL BRSInstallDeviceHook(id<MTLDevice> device) {
     Class cls = object_getClass(device);
-    BOOL ok = BRSInstallInstanceHook(cls,
-                                     @selector(newTextureWithDescriptor:),
-                                     (IMP)BRS_newTextureWithDescriptor,
-                                     &gOriginalNewTexture);
-    if (!ok) {
-        BRSLog([NSString stringWithFormat:@"ERROR %@ has no newTextureWithDescriptor:", NSStringFromClass(cls)]);
-        return NO;
-    }
+    BOOL ok = BRSInstallInstanceHook(cls, @selector(newTextureWithDescriptor:), (IMP)BRS_newTextureWithDescriptor, &gOriginalNewTexture);
+    if (ok) BRSLog([NSString stringWithFormat:@"DEVICE_HOOK %@ gpu=%@", NSStringFromClass(cls), device.name ?: @"unknown"]);
+    return ok;
+}
 
-    BRSLog([NSString stringWithFormat:@"DEVICE_HOOK class=%@ gpu=%@", NSStringFromClass(cls), device.name ?: @"unknown"]);
-    return YES;
+static void BRSInstallLayerHook(void) {
+    Class cls = NSClassFromString(@"CAMetalLayer");
+    if (!cls) return;
+    BRSInstallInstanceHook(cls, @selector(setDrawableSize:), (IMP)BRS_setDrawableSize, &gOriginalSetDrawableSize);
 }
 
 __attribute__((constructor))
@@ -381,40 +319,36 @@ static void BedrockSceneScaleInit(void) {
 
         NSString *model = BRSDeviceModel();
         gEnabledForDevice = [model isEqualToString:@"iPhone14,5"];
-        gPatchedTextures = [NSHashTable weakObjectsHashTable];
 
-        NSString *header = [NSString stringWithFormat:
-                            @"BedrockSceneScale experimental v2\ndevice=%@\nscale=%.4f\nmode=coordinated-target-viewport-scissor\n---",
-                            model, kSceneScale];
+        NSString *header = [NSString stringWithFormat:@"BedrockSceneScale experimental v3\ndevice=%@\nscale=%.4f\nmode=coordinated-scene-scale+low-latency\n---", model, kSceneScale];
         [header writeToFile:gLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
         if (!gEnabledForDevice) {
-            BRSLog(@"DISABLED: this experimental build is gated to iPhone14,5 only.");
+            BRSLog(@"DISABLED wrong device model");
             return;
         }
-
         if (kSceneScale < 0.50 || kSceneScale > 1.00) {
-            BRSLog(@"DISABLED: scale outside safe experimental range 0.50...1.00");
-            gEnabledForDevice = NO;
+            BRSLog(@"DISABLED invalid scale");
             return;
         }
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) {
-            BRSLog(@"ERROR MTLCreateSystemDefaultDevice returned nil");
+            BRSLog(@"DISABLED no Metal device");
             return;
         }
 
+        // Install encoder hooks first. If they fail, do not install texture scaling.
         if (!BRSInstallEncoderHooks(device)) {
-            BRSLog(@"DISABLED: encoder hooks incomplete; texture scaling was NOT installed.");
+            BRSLog(@"DISABLED encoder coordination unavailable");
             return;
         }
-
         if (!BRSInstallDeviceHook(device)) {
-            BRSLog(@"DISABLED: texture hook install failed.");
+            BRSLog(@"DISABLED texture hook unavailable");
             return;
         }
 
-        BRSLog(@"ACTIVE: native presentation remains untouched. Only tracked RenderDragon targets and their matching full-frame viewport/scissor state are scaled.");
+        BRSInstallLayerHook();
+        BRSLog(@"ACTIVE v3: coordinated scaling enabled; per-frame file logging removed; native drawable preserved; maximumDrawableCount=2 on native game layer.");
     }
 }
