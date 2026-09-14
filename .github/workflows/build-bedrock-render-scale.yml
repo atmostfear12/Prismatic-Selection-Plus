@@ -36,6 +36,7 @@ jobs:
           SCALE="${{ github.event.inputs.scale }}"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p build
+          EXTRA_SOURCE=""
 
           case "$MODE" in
             performance)
@@ -50,6 +51,7 @@ jobs:
               ;;
             scene-scale)
               SOURCE="bedrock-render-scale/SceneScale.m"
+              EXTRA_SOURCE="bedrock-render-scale/BannerSuppress.m"
               OUTPUT="build/BedrockSceneScale.dylib"
               INSTALL_NAME="/Library/MobileSubstrate/DynamicLibraries/BedrockSceneScale.dylib"
               ;;
@@ -78,7 +80,7 @@ jobs:
             -framework Metal \
             -framework UIKit \
             -install_name "$INSTALL_NAME" \
-            "$SOURCE" \
+            "$SOURCE" ${EXTRA_SOURCE:+"$EXTRA_SOURCE"} \
             -o "$OUTPUT"
 
           echo "=== mode ==="
