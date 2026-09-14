@@ -18,7 +18,7 @@ jobs:
         with:
           ref: bedrock-render-scale
 
-      - name: Build Hynis-style arm64 iOS diagnostic dylib
+      - name: Build unsigned Hynis-style arm64 iOS diagnostic dylib
         shell: bash
         run: |
           set -euxo pipefail
@@ -40,16 +40,14 @@ jobs:
           echo "=== linked libraries ==="
           otool -L build/BedrockRenderScale.dylib
           echo "=== load commands ==="
-          otool -l build/BedrockRenderScale.dylib | egrep -A6 'LC_ID_DYLIB|LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' || true
+          otool -l build/BedrockRenderScale.dylib | egrep -A6 'LC_ID_DYLIB|LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS|LC_CODE_SIGNATURE' || true
 
-      - name: Ad-hoc sign dylib
-        run: |
-          codesign --force --sign - build/BedrockRenderScale.dylib
-          codesign -dv build/BedrockRenderScale.dylib || true
+          echo "=== signature check (expected unsigned) ==="
+          codesign -dv build/BedrockRenderScale.dylib && exit 1 || true
 
-      - name: Upload dylib
+      - name: Upload unsigned dylib
         uses: actions/upload-artifact@v4
         with:
-          name: BedrockRenderScale-hynis-diagnostic
+          name: BedrockRenderScale-unsigned-diagnostic
           path: build/BedrockRenderScale.dylib
           if-no-files-found: error
