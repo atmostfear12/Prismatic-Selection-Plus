@@ -20,6 +20,8 @@ static IMP gOriginalSetViewports = NULL;
 static IMP gOriginalSetScissorRect = NULL;
 static IMP gOriginalSetScissorRects = NULL;
 static IMP gOriginalNewRenderPipeline = NULL;
+static IMP gOriginalTextureGetBytes = NULL;
+static IMP gOriginalLabelSetText = NULL;
 
 static BOOL gEnabledForDevice = NO;
 static char kBRSPatchedTextureKey;
@@ -190,6 +192,53 @@ static void BRS_setScissorRects(id self, SEL _cmd, const MTLScissorRect *rects, 
     ((void(*)(id, SEL, const MTLScissorRect *, NSUInteger))gOriginalSetScissorRects)(self, _cmd, local, count);
 }
 
+// Correct native-size CPU readback of a scene-scaled RGBA8 target. Minecraft
+// uses a readback when creating the world-list screenshot. Without this bridge,
+// native row geometry can be applied to the 0.66 target and create striping.
+static void BRS_getBytes(id self, SEL _cmd, void *pixelBytes, NSUInteger bytesPerRow,
+                         MTLRegion region, NSUInteger level) {
+    if (!gOriginalTextureGetBytes || !pixelBytes || !BRSTextureWasPatched((id<MTLTexture>)self) || level != 0) {
+        ((void(*)(id, SEL, void *, NSUInteger, MTLRegion, NSUInteger))gOriginalTextureGetBytes)(self, _cmd, pixelBytes, bytesPerRow, region, level);
+        return;
+    }
+
+    id<MTLTexture> tex = (id<MTLTexture>)self;
+    BOOL nativeRequest = BRSIsNativeSize(region.size.width, region.size.height) &&
+                         region.origin.x == 0 && region.origin.y == 0 && region.origin.z == 0 &&
+                         region.size.depth == 1;
+    BOOL isRGBA8 = (tex.pixelFormat == MTLPixelFormatRGBA8Unorm || tex.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB ||
+                    tex.pixelFormat == MTLPixelFormatBGRA8Unorm || tex.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB);
+
+    if (!nativeRequest || !isRGBA8 || bytesPerRow < region.size.width * 4 || tex.width == 0 || tex.height == 0) {
+        ((void(*)(id, SEL, void *, NSUInteger, MTLRegion, NSUInteger))gOriginalTextureGetBytes)(self, _cmd, pixelBytes, bytesPerRow, region, level);
+        return;
+    }
+
+    const NSUInteger srcW = tex.width;
+    const NSUInteger srcH = tex.height;
+    const NSUInteger srcRow = srcW * 4;
+    const size_t tempSize = (size_t)srcRow * (size_t)srcH;
+    uint8_t *temp = (uint8_t *)malloc(tempSize);
+    if (!temp) return;
+
+    MTLRegion srcRegion = MTLRegionMake2D(0, 0, srcW, srcH);
+    ((void(*)(id, SEL, void *, NSUInteger, MTLRegion, NSUInteger))gOriginalTextureGetBytes)(self, _cmd, temp, srcRow, srcRegion, level);
+
+    const NSUInteger dstW = region.size.width;
+    const NSUInteger dstH = region.size.height;
+    uint8_t *dst = (uint8_t *)pixelBytes;
+    for (NSUInteger y = 0; y < dstH; y++) {
+        NSUInteger sy = MIN(srcH - 1, (NSUInteger)(((uint64_t)y * srcH) / dstH));
+        uint8_t *dstRow = dst + (size_t)y * bytesPerRow;
+        const uint8_t *srcRowPtr = temp + (size_t)sy * srcRow;
+        for (NSUInteger x = 0; x < dstW; x++) {
+            NSUInteger sx = MIN(srcW - 1, (NSUInteger)(((uint64_t)x * srcW) / dstW));
+            memcpy(dstRow + (size_t)x * 4, srcRowPtr + (size_t)sx * 4, 4);
+        }
+    }
+    free(temp);
+}
+
 static id BRS_newRenderPipelineStateWithDescriptor(id self, SEL _cmd, MTLRenderPipelineDescriptor *descriptor, NSError **error) {
     if (!gOriginalNewRenderPipeline || !descriptor) {
         return ((id(*)(id, SEL, MTLRenderPipelineDescriptor *, NSError **))gOriginalNewRenderPipeline)(self, _cmd, descriptor, error);
@@ -234,6 +283,14 @@ static BOOL BRSInstallEncoderHooks(id<MTLDevice> device) {
     td.usage = MTLTextureUsageRenderTarget;
     id<MTLTexture> temp = [device newTextureWithDescriptor:td];
     if (!temp) return NO;
+
+    Class textureClass = object_getClass(temp);
+    if (class_getInstanceMethod(textureClass, @selector(getBytes:bytesPerRow:fromRegion:mipmapLevel:))) {
+        BRSInstallInstanceHook(textureClass,
+                               @selector(getBytes:bytesPerRow:fromRegion:mipmapLevel:),
+                               (IMP)BRS_getBytes,
+                               &gOriginalTextureGetBytes);
+    }
 
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = temp;
@@ -331,6 +388,47 @@ static BOOL BRSInstallDeviceHooks(id<MTLDevice> device) {
     return textureOK && pipelineOK;
 }
 
+static BOOL BRSIsHynisBannerText(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return NO;
+    NSString *lower = text.lowercaseString;
+    return [lower containsString:@"hynisloader"] || [lower containsString:@"congcq"];
+}
+
+static void BRS_labelSetText(UILabel *self, SEL _cmd, NSString *text) {
+    ((void(*)(id, SEL, NSString *))gOriginalLabelSetText)(self, _cmd, text);
+    if (!BRSIsHynisBannerText(text)) return;
+
+    self.text = @"";
+    __weak UILabel *weakLabel = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UILabel *label = weakLabel;
+        if (!label) return;
+        UIView *candidate = label;
+        UIView *best = label;
+        UIScreen *screen = UIScreen.mainScreen;
+        CGFloat maxW = MAX(screen.bounds.size.width, screen.bounds.size.height) * 0.95;
+        for (NSUInteger i = 0; i < 4 && candidate.superview; i++) {
+            candidate = candidate.superview;
+            CGRect b = candidate.bounds;
+            if (b.size.height > 0.0 && b.size.height <= 180.0 && b.size.width > 0.0 && b.size.width <= maxW) {
+                best = candidate;
+            } else {
+                break;
+            }
+        }
+        best.hidden = YES;
+        best.userInteractionEnabled = NO;
+    });
+}
+
+static void BRSInstallHynisBannerSuppression(void) {
+    Class cls = [UILabel class];
+    Method method = class_getInstanceMethod(cls, @selector(setText:));
+    if (!method) return;
+    gOriginalLabelSetText = method_getImplementation(method);
+    method_setImplementation(method, (IMP)BRS_labelSetText);
+}
+
 __attribute__((constructor))
 static void BedrockSceneScaleInit(void) {
     @autoreleasepool {
@@ -338,6 +436,8 @@ static void BedrockSceneScaleInit(void) {
         gEnabledForDevice = [model isEqualToString:@"iPhone14,5"];
         if (!gEnabledForDevice) return;
         if (kSceneScale < 0.50 || kSceneScale > 1.00) return;
+
+        BRSInstallHynisBannerSuppression();
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) return;
