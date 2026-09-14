@@ -1,7 +1,5 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <QuartzCore/CAMetalLayer.h>
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <sys/utsname.h>
 #import <math.h>
@@ -20,14 +18,10 @@ static IMP gOriginalSetViewport = NULL;
 static IMP gOriginalSetViewports = NULL;
 static IMP gOriginalSetScissorRect = NULL;
 static IMP gOriginalSetScissorRects = NULL;
-static IMP gOriginalSetDrawableSize = NULL;
 
 static NSString *gLogPath = nil;
 static BOOL gEnabledForDevice = NO;
 static NSUInteger gPatchCount = 0;
-static NSUInteger gViewportPatchCount = 0;
-static NSUInteger gScissorPatchCount = 0;
-static NSUInteger gLayerTuneCount = 0;
 
 static char kBRSPatchedTextureKey;
 static char kBRSPatchedEncoderKey;
@@ -76,7 +70,7 @@ static BOOL BRSShouldScaleDescriptor(MTLTextureDescriptor *d) {
     if (!gEnabledForDevice || !d) return NO;
     if (!BRSIsNativeSize(d.width, d.height)) return NO;
 
-    MTLTextureUsage required = (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
+    MTLTextureUsage required = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     if ((d.usage & required) != required) return NO;
     if (d.textureType != MTLTextureType2D) return NO;
     if (d.sampleCount != 1) return NO;
@@ -88,8 +82,7 @@ static BOOL BRSShouldScaleDescriptor(MTLTextureDescriptor *d) {
 
 static NSUInteger BRSScaledDimension(NSUInteger value) {
     double scaled = floor((double)value * kSceneScale);
-    if (scaled < 2.0) scaled = 2.0;
-    return (NSUInteger)scaled;
+    return (NSUInteger)MAX(2.0, scaled);
 }
 
 static BOOL BRSNear(double a, double b) {
@@ -123,11 +116,11 @@ static BOOL BRSAdjustScissor(MTLScissorRect *r) {
 }
 
 static inline BOOL BRSTextureWasPatched(id<MTLTexture> texture) {
-    return texture && (objc_getAssociatedObject(texture, &kBRSPatchedTextureKey) != nil);
+    return texture && objc_getAssociatedObject(texture, &kBRSPatchedTextureKey) != nil;
 }
 
 static inline BOOL BRSEncoderIsPatched(id encoder) {
-    return encoder && (objc_getAssociatedObject(encoder, &kBRSPatchedEncoderKey) != nil);
+    return encoder && objc_getAssociatedObject(encoder, &kBRSPatchedEncoderKey) != nil;
 }
 
 static BOOL BRSRenderPassUsesPatchedTexture(MTLRenderPassDescriptor *descriptor) {
@@ -181,10 +174,7 @@ static id BRS_renderCommandEncoderWithDescriptor(id self, SEL _cmd, MTLRenderPas
 static void BRS_setViewport(id self, SEL _cmd, MTLViewport viewport) {
     if (BRSEncoderIsPatched(self)) {
         MTLViewport adjusted = viewport;
-        if (BRSAdjustViewport(&adjusted)) {
-            gViewportPatchCount++;
-            viewport = adjusted;
-        }
+        if (BRSAdjustViewport(&adjusted)) viewport = adjusted;
     }
     ((void(*)(id, SEL, MTLViewport))gOriginalSetViewport)(self, _cmd, viewport);
 }
@@ -197,19 +187,14 @@ static void BRS_setViewports(id self, SEL _cmd, const MTLViewport *viewports, NS
 
     MTLViewport local[16];
     memcpy(local, viewports, sizeof(MTLViewport) * count);
-    for (NSUInteger i = 0; i < count; i++) {
-        if (BRSAdjustViewport(&local[i])) gViewportPatchCount++;
-    }
+    for (NSUInteger i = 0; i < count; i++) BRSAdjustViewport(&local[i]);
     ((void(*)(id, SEL, const MTLViewport *, NSUInteger))gOriginalSetViewports)(self, _cmd, local, count);
 }
 
 static void BRS_setScissorRect(id self, SEL _cmd, MTLScissorRect rect) {
     if (BRSEncoderIsPatched(self)) {
         MTLScissorRect adjusted = rect;
-        if (BRSAdjustScissor(&adjusted)) {
-            gScissorPatchCount++;
-            rect = adjusted;
-        }
+        if (BRSAdjustScissor(&adjusted)) rect = adjusted;
     }
     ((void(*)(id, SEL, MTLScissorRect))gOriginalSetScissorRect)(self, _cmd, rect);
 }
@@ -222,28 +207,8 @@ static void BRS_setScissorRects(id self, SEL _cmd, const MTLScissorRect *rects, 
 
     MTLScissorRect local[16];
     memcpy(local, rects, sizeof(MTLScissorRect) * count);
-    for (NSUInteger i = 0; i < count; i++) {
-        if (BRSAdjustScissor(&local[i])) gScissorPatchCount++;
-    }
+    for (NSUInteger i = 0; i < count; i++) BRSAdjustScissor(&local[i]);
     ((void(*)(id, SEL, const MTLScissorRect *, NSUInteger))gOriginalSetScissorRects)(self, _cmd, local, count);
-}
-
-static void BRSTuneMetalLayer(CAMetalLayer *layer) {
-    if (!layer || !gEnabledForDevice) return;
-    CGSize s = layer.drawableSize;
-    if (!BRSIsNativeSize((NSUInteger)llround(s.width), (NSUInteger)llround(s.height))) return;
-
-    // Two drawable buffers instead of the common three-buffer queue reduces queued-frame latency.
-    // Keep the drawable itself native resolution; only queue depth changes here.
-    if (@available(iOS 11.2, *)) {
-        if (layer.maximumDrawableCount != 2) layer.maximumDrawableCount = 2;
-    }
-    gLayerTuneCount++;
-}
-
-static void BRS_setDrawableSize(id self, SEL _cmd, CGSize size) {
-    ((void(*)(id, SEL, CGSize))gOriginalSetDrawableSize)(self, _cmd, size);
-    BRSTuneMetalLayer((CAMetalLayer *)self);
 }
 
 static BOOL BRSInstallInstanceHook(Class cls, SEL sel, IMP replacement, IMP *original) {
@@ -261,8 +226,9 @@ static BOOL BRSInstallInstanceHook(Class cls, SEL sel, IMP replacement, IMP *ori
 
 static BOOL BRSInstallEncoderHooks(id<MTLDevice> device) {
     id<MTLCommandQueue> queue = [device newCommandQueue];
+    if (!queue) return NO;
     id<MTLCommandBuffer> cb = [queue commandBuffer];
-    if (!queue || !cb) return NO;
+    if (!cb) return NO;
 
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:4 height:4 mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
@@ -304,12 +270,6 @@ static BOOL BRSInstallDeviceHook(id<MTLDevice> device) {
     return ok;
 }
 
-static void BRSInstallLayerHook(void) {
-    Class cls = NSClassFromString(@"CAMetalLayer");
-    if (!cls) return;
-    BRSInstallInstanceHook(cls, @selector(setDrawableSize:), (IMP)BRS_setDrawableSize, &gOriginalSetDrawableSize);
-}
-
 __attribute__((constructor))
 static void BedrockSceneScaleInit(void) {
     @autoreleasepool {
@@ -320,7 +280,7 @@ static void BedrockSceneScaleInit(void) {
         NSString *model = BRSDeviceModel();
         gEnabledForDevice = [model isEqualToString:@"iPhone14,5"];
 
-        NSString *header = [NSString stringWithFormat:@"BedrockSceneScale experimental v3\ndevice=%@\nscale=%.4f\nmode=coordinated-scene-scale+low-latency\n---", model, kSceneScale];
+        NSString *header = [NSString stringWithFormat:@"BedrockSceneScale experimental v4\ndevice=%@\nscale=%.4f\nmode=coordinated-scene-scale\n---", model, kSceneScale];
         [header writeToFile:gLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
         if (!gEnabledForDevice) {
@@ -338,7 +298,6 @@ static void BedrockSceneScaleInit(void) {
             return;
         }
 
-        // Install encoder hooks first. If they fail, do not install texture scaling.
         if (!BRSInstallEncoderHooks(device)) {
             BRSLog(@"DISABLED encoder coordination unavailable");
             return;
@@ -348,7 +307,6 @@ static void BedrockSceneScaleInit(void) {
             return;
         }
 
-        BRSInstallLayerHook();
-        BRSLog(@"ACTIVE v3: coordinated scaling enabled; per-frame file logging removed; native drawable preserved; maximumDrawableCount=2 on native game layer.");
+        BRSLog(@"ACTIVE v4: coordinated scene scaling enabled; CAMetalLayer queue depth untouched.");
     }
 }
