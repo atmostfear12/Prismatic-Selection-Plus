@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <sys/utsname.h>
 #import <math.h>
@@ -18,31 +19,22 @@ static IMP gOriginalSetViewport = NULL;
 static IMP gOriginalSetViewports = NULL;
 static IMP gOriginalSetScissorRect = NULL;
 static IMP gOriginalSetScissorRects = NULL;
+static IMP gOriginalNewRenderPipeline = NULL;
 
-static NSString *gLogPath = nil;
 static BOOL gEnabledForDevice = NO;
-static NSUInteger gPatchCount = 0;
-
 static char kBRSPatchedTextureKey;
 static char kBRSPatchedEncoderKey;
+
+static id<MTLBinaryArchive> gPipelineArchive = nil;
+static NSString *gPipelineArchivePath = nil;
+static NSMutableArray<MTLRenderPipelineDescriptor *> *gCapturedPipelineDescriptors = nil;
+static dispatch_queue_t gArchiveQueue;
+static BOOL gArchiveFlushStarted = NO;
 
 static NSString *BRSDeviceModel(void) {
     struct utsname info;
     uname(&info);
     return [NSString stringWithUTF8String:info.machine];
-}
-
-static void BRSLog(NSString *line) {
-    if (!line || !gLogPath) return;
-    NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
-    if (!fh) {
-        [[NSFileManager defaultManager] createFileAtPath:gLogPath contents:data attributes:nil];
-        return;
-    }
-    [fh seekToEndOfFile];
-    [fh writeData:data];
-    [fh closeFile];
 }
 
 static BOOL BRSIsKnownRenderTargetFormat(MTLPixelFormat pf) {
@@ -140,25 +132,12 @@ static id BRS_newTextureWithDescriptor(id self, SEL _cmd, MTLTextureDescriptor *
     }
 
     MTLTextureDescriptor *patched = [descriptor copy];
-    NSUInteger oldW = patched.width;
-    NSUInteger oldH = patched.height;
-    patched.width = BRSScaledDimension(oldW);
-    patched.height = BRSScaledDimension(oldH);
+    patched.width = BRSScaledDimension(patched.width);
+    patched.height = BRSScaledDimension(patched.height);
 
     id texture = ((id(*)(id, SEL, MTLTextureDescriptor *))gOriginalNewTexture)(self, _cmd, patched);
     if (texture) {
         objc_setAssociatedObject(texture, &kBRSPatchedTextureKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-
-    NSUInteger count = ++gPatchCount;
-    if (count <= 24) {
-        BRSLog([NSString stringWithFormat:@"TARGET #%lu %lux%lu -> %lux%lu pf=%lu storage=%lu %@",
-                (unsigned long)count,
-                (unsigned long)oldW, (unsigned long)oldH,
-                (unsigned long)patched.width, (unsigned long)patched.height,
-                (unsigned long)descriptor.pixelFormat,
-                (unsigned long)descriptor.storageMode,
-                texture ? @"OK" : @"FAIL"]);
     }
     return texture;
 }
@@ -211,6 +190,27 @@ static void BRS_setScissorRects(id self, SEL _cmd, const MTLScissorRect *rects, 
     ((void(*)(id, SEL, const MTLScissorRect *, NSUInteger))gOriginalSetScissorRects)(self, _cmd, local, count);
 }
 
+static id BRS_newRenderPipelineStateWithDescriptor(id self, SEL _cmd, MTLRenderPipelineDescriptor *descriptor, NSError **error) {
+    if (!gOriginalNewRenderPipeline || !descriptor) {
+        return ((id(*)(id, SEL, MTLRenderPipelineDescriptor *, NSError **))gOriginalNewRenderPipeline)(self, _cmd, descriptor, error);
+    }
+
+    MTLRenderPipelineDescriptor *patched = [descriptor copy];
+    if (@available(iOS 14.0, *)) {
+        if (gPipelineArchive) patched.binaryArchives = @[gPipelineArchive];
+    }
+
+    if (gCapturedPipelineDescriptors) {
+        @synchronized (gCapturedPipelineDescriptors) {
+            if (gCapturedPipelineDescriptors.count < 128) {
+                [gCapturedPipelineDescriptors addObject:[descriptor copy]];
+            }
+        }
+    }
+
+    return ((id(*)(id, SEL, MTLRenderPipelineDescriptor *, NSError **))gOriginalNewRenderPipeline)(self, _cmd, patched, error);
+}
+
 static BOOL BRSInstallInstanceHook(Class cls, SEL sel, IMP replacement, IMP *original) {
     if (!cls || !original) return NO;
     Method method = class_getInstanceMethod(cls, sel);
@@ -257,56 +257,101 @@ static BOOL BRSInstallEncoderHooks(id<MTLDevice> device) {
         BRSInstallInstanceHook(encClass, @selector(setScissorRects:count:), (IMP)BRS_setScissorRects, &gOriginalSetScissorRects);
     }
 
-    BRSLog([NSString stringWithFormat:@"ENCODER_HOOK %@ %@ render=%@ viewport=%@ scissor=%@",
-            NSStringFromClass(cbClass), NSStringFromClass(encClass),
-            okRender ? @"YES" : @"NO", okViewport ? @"YES" : @"NO", okScissor ? @"YES" : @"NO"]);
     return okRender && okViewport && okScissor;
 }
 
-static BOOL BRSInstallDeviceHook(id<MTLDevice> device) {
+static void BRSPreparePipelineArchive(id<MTLDevice> device) {
+    if (@available(iOS 14.0, *)) {
+        NSArray<NSString *> *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+        NSString *cacheDir = caches.firstObject ?: NSTemporaryDirectory();
+        gPipelineArchivePath = [cacheDir stringByAppendingPathComponent:@"BedrockA15RenderPipelines.metalarc"];
+        gCapturedPipelineDescriptors = [NSMutableArray array];
+        gArchiveQueue = dispatch_queue_create("bedrock.a15.pipeline.archive", DISPATCH_QUEUE_SERIAL);
+
+        MTLBinaryArchiveDescriptor *bd = [MTLBinaryArchiveDescriptor new];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:gPipelineArchivePath]) {
+            bd.url = [NSURL fileURLWithPath:gPipelineArchivePath];
+        }
+        NSError *archiveError = nil;
+        gPipelineArchive = [device newBinaryArchiveWithDescriptor:bd error:&archiveError];
+        if (!gPipelineArchive) {
+            bd.url = nil;
+            gPipelineArchive = [device newBinaryArchiveWithDescriptor:bd error:nil];
+        }
+    }
+}
+
+static void BRSFlushPipelineArchive(void) {
+    if (@available(iOS 14.0, *)) {
+        if (!gPipelineArchive || !gPipelineArchivePath || gArchiveFlushStarted) return;
+        gArchiveFlushStarted = YES;
+
+        NSArray<MTLRenderPipelineDescriptor *> *snapshot = nil;
+        @synchronized (gCapturedPipelineDescriptors) {
+            snapshot = [gCapturedPipelineDescriptors copy];
+        }
+        if (snapshot.count == 0) {
+            gArchiveFlushStarted = NO;
+            return;
+        }
+
+        __block UIBackgroundTaskIdentifier bg = UIBackgroundTaskInvalid;
+        bg = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"BedrockPipelineCache" expirationHandler:^{
+            if (bg != UIBackgroundTaskInvalid) {
+                [[UIApplication sharedApplication] endBackgroundTask:bg];
+                bg = UIBackgroundTaskInvalid;
+            }
+        }];
+
+        dispatch_async(gArchiveQueue, ^{
+            for (MTLRenderPipelineDescriptor *d in snapshot) {
+                @autoreleasepool {
+                    [gPipelineArchive addRenderPipelineFunctionsWithDescriptor:d error:nil];
+                }
+            }
+            [gPipelineArchive serializeToURL:[NSURL fileURLWithPath:gPipelineArchivePath] error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                gArchiveFlushStarted = NO;
+                if (bg != UIBackgroundTaskInvalid) {
+                    [[UIApplication sharedApplication] endBackgroundTask:bg];
+                    bg = UIBackgroundTaskInvalid;
+                }
+            });
+        });
+    }
+}
+
+static BOOL BRSInstallDeviceHooks(id<MTLDevice> device) {
     Class cls = object_getClass(device);
-    BOOL ok = BRSInstallInstanceHook(cls, @selector(newTextureWithDescriptor:), (IMP)BRS_newTextureWithDescriptor, &gOriginalNewTexture);
-    if (ok) BRSLog([NSString stringWithFormat:@"DEVICE_HOOK %@ gpu=%@", NSStringFromClass(cls), device.name ?: @"unknown"]);
-    return ok;
+    BOOL textureOK = BRSInstallInstanceHook(cls, @selector(newTextureWithDescriptor:), (IMP)BRS_newTextureWithDescriptor, &gOriginalNewTexture);
+    BOOL pipelineOK = YES;
+    if (class_getInstanceMethod(cls, @selector(newRenderPipelineStateWithDescriptor:error:))) {
+        pipelineOK = BRSInstallInstanceHook(cls, @selector(newRenderPipelineStateWithDescriptor:error:), (IMP)BRS_newRenderPipelineStateWithDescriptor, &gOriginalNewRenderPipeline);
+    }
+    return textureOK && pipelineOK;
 }
 
 __attribute__((constructor))
 static void BedrockSceneScaleInit(void) {
     @autoreleasepool {
-        NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *documents = docs.firstObject ?: NSTemporaryDirectory();
-        gLogPath = [documents stringByAppendingPathComponent:@"BedrockSceneScale.log"];
-
         NSString *model = BRSDeviceModel();
         gEnabledForDevice = [model isEqualToString:@"iPhone14,5"];
-
-        NSString *header = [NSString stringWithFormat:@"BedrockSceneScale experimental v4\ndevice=%@\nscale=%.4f\nmode=coordinated-scene-scale\n---", model, kSceneScale];
-        [header writeToFile:gLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-        if (!gEnabledForDevice) {
-            BRSLog(@"DISABLED wrong device model");
-            return;
-        }
-        if (kSceneScale < 0.50 || kSceneScale > 1.00) {
-            BRSLog(@"DISABLED invalid scale");
-            return;
-        }
+        if (!gEnabledForDevice) return;
+        if (kSceneScale < 0.50 || kSceneScale > 1.00) return;
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-        if (!device) {
-            BRSLog(@"DISABLED no Metal device");
-            return;
-        }
+        if (!device) return;
 
-        if (!BRSInstallEncoderHooks(device)) {
-            BRSLog(@"DISABLED encoder coordination unavailable");
-            return;
-        }
-        if (!BRSInstallDeviceHook(device)) {
-            BRSLog(@"DISABLED texture hook unavailable");
-            return;
-        }
+        BRSPreparePipelineArchive(device);
 
-        BRSLog(@"ACTIVE v4: coordinated scene scaling enabled; CAMetalLayer queue depth untouched.");
+        if (!BRSInstallEncoderHooks(device)) return;
+        if (!BRSInstallDeviceHooks(device)) return;
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            BRSFlushPipelineArchive();
+        }];
     }
 }
