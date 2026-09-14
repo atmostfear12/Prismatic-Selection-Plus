@@ -6,14 +6,15 @@ on:
       mode:
         description: "Build mode"
         required: true
-        default: "scene-scale"
+        default: "performance"
         type: choice
         options:
+          - performance
           - scene-scale
           - probe
           - scale
       scale:
-        description: "Scene-scale target (0.66 recommended); legacy scale mode also uses this value"
+        description: "Scene-scale target; ignored by performance mode"
         required: true
         default: "0.66"
 
@@ -37,6 +38,11 @@ jobs:
           mkdir -p build
 
           case "$MODE" in
+            performance)
+              SOURCE="bedrock-render-scale/PerformanceProbe.m"
+              OUTPUT="build/BedrockPerformance.dylib"
+              INSTALL_NAME="/Library/MobileSubstrate/DynamicLibraries/BedrockPerformance.dylib"
+              ;;
             probe)
               SOURCE="bedrock-render-scale/Probe.m"
               OUTPUT="build/BedrockRenderProbe.dylib"
@@ -90,6 +96,9 @@ jobs:
           codesign -dv "$OUTPUT" && exit 1 || true
 
           case "$MODE" in
+            performance)
+              echo "ARTIFACT_NAME=BedrockPerformance-unsigned" >> "$GITHUB_ENV"
+              ;;
             probe)
               echo "ARTIFACT_NAME=BedrockRenderProbe-unsigned" >> "$GITHUB_ENV"
               ;;
