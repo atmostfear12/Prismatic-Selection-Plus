@@ -6,15 +6,16 @@ on:
       mode:
         description: "Build mode"
         required: true
-        default: "probe"
+        default: "scene-scale"
         type: choice
         options:
+          - scene-scale
           - probe
           - scale
       scale:
-        description: "Scale mode only (0.50 = half width and height)"
+        description: "Scene-scale target (0.66 recommended); legacy scale mode also uses this value"
         required: true
-        default: "0.50"
+        default: "0.66"
 
 jobs:
   build:
@@ -35,15 +36,27 @@ jobs:
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p build
 
-          if [[ "$MODE" == "probe" ]]; then
-            SOURCE="bedrock-render-scale/Probe.m"
-            OUTPUT="build/BedrockRenderProbe.dylib"
-            INSTALL_NAME="/Library/MobileSubstrate/DynamicLibraries/BedrockRenderProbe.dylib"
-          else
-            SOURCE="bedrock-render-scale/Tweak.m"
-            OUTPUT="build/BedrockRenderScale.dylib"
-            INSTALL_NAME="/Library/MobileSubstrate/DynamicLibraries/BedrockRenderScale.dylib"
-          fi
+          case "$MODE" in
+            probe)
+              SOURCE="bedrock-render-scale/Probe.m"
+              OUTPUT="build/BedrockRenderProbe.dylib"
+              INSTALL_NAME="/Library/MobileSubstrate/DynamicLibraries/BedrockRenderProbe.dylib"
+              ;;
+            scene-scale)
+              SOURCE="bedrock-render-scale/SceneScale.m"
+              OUTPUT="build/BedrockSceneScale.dylib"
+              INSTALL_NAME="/Library/MobileSubstrate/DynamicLibraries/BedrockSceneScale.dylib"
+              ;;
+            scale)
+              SOURCE="bedrock-render-scale/Tweak.m"
+              OUTPUT="build/BedrockRenderScale.dylib"
+              INSTALL_NAME="/Library/MobileSubstrate/DynamicLibraries/BedrockRenderScale.dylib"
+              ;;
+            *)
+              echo "Unknown mode: $MODE" >&2
+              exit 2
+              ;;
+          esac
 
           xcrun --sdk iphoneos clang \
             -arch arm64 \
@@ -53,6 +66,7 @@ jobs:
             -miphoneos-version-min=14.0 \
             -isysroot "$SDK" \
             -DBEDROCK_RENDER_SCALE="$SCALE" \
+            -DBEDROCK_SCENE_SCALE="$SCALE" \
             -framework Foundation \
             -framework QuartzCore \
             -framework Metal \
@@ -63,6 +77,8 @@ jobs:
 
           echo "=== mode ==="
           echo "$MODE"
+          echo "=== scale ==="
+          echo "$SCALE"
           echo "=== file ==="
           file "$OUTPUT"
           echo "=== linked libraries ==="
@@ -73,13 +89,18 @@ jobs:
           echo "=== signature check (expected unsigned) ==="
           codesign -dv "$OUTPUT" && exit 1 || true
 
-          if [[ "$MODE" == "probe" ]]; then
-            echo "ARTIFACT_NAME=BedrockRenderProbe-unsigned" >> "$GITHUB_ENV"
-            echo "ARTIFACT_PATH=$OUTPUT" >> "$GITHUB_ENV"
-          else
-            echo "ARTIFACT_NAME=BedrockRenderScale-${SCALE}-unsigned" >> "$GITHUB_ENV"
-            echo "ARTIFACT_PATH=$OUTPUT" >> "$GITHUB_ENV"
-          fi
+          case "$MODE" in
+            probe)
+              echo "ARTIFACT_NAME=BedrockRenderProbe-unsigned" >> "$GITHUB_ENV"
+              ;;
+            scene-scale)
+              echo "ARTIFACT_NAME=BedrockSceneScale-${SCALE}-unsigned" >> "$GITHUB_ENV"
+              ;;
+            scale)
+              echo "ARTIFACT_NAME=BedrockRenderScale-${SCALE}-unsigned" >> "$GITHUB_ENV"
+              ;;
+          esac
+          echo "ARTIFACT_PATH=$OUTPUT" >> "$GITHUB_ENV"
 
       - name: Upload unsigned dylib
         uses: actions/upload-artifact@v4
