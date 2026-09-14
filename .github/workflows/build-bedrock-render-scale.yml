@@ -3,8 +3,16 @@ name: Build BedrockRenderScale
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Build mode"
+        required: true
+        default: "probe"
+        type: choice
+        options:
+          - probe
+          - scale
       scale:
-        description: "Render scale (0.50 = half width and height)"
+        description: "Scale mode only (0.50 = half width and height)"
         required: true
         default: "0.50"
 
@@ -18,13 +26,24 @@ jobs:
         with:
           ref: bedrock-render-scale
 
-      - name: Build unsigned arm64 iOS render-scale dylib
+      - name: Build unsigned arm64 iOS dylib
         shell: bash
         run: |
           set -euxo pipefail
+          MODE="${{ github.event.inputs.mode }}"
           SCALE="${{ github.event.inputs.scale }}"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p build
+
+          if [[ "$MODE" == "probe" ]]; then
+            SOURCE="bedrock-render-scale/Probe.m"
+            OUTPUT="build/BedrockRenderProbe.dylib"
+            INSTALL_NAME="/Library/MobileSubstrate/DynamicLibraries/BedrockRenderProbe.dylib"
+          else
+            SOURCE="bedrock-render-scale/Tweak.m"
+            OUTPUT="build/BedrockRenderScale.dylib"
+            INSTALL_NAME="/Library/MobileSubstrate/DynamicLibraries/BedrockRenderScale.dylib"
+          fi
 
           xcrun --sdk iphoneos clang \
             -arch arm64 \
@@ -37,23 +56,34 @@ jobs:
             -framework Foundation \
             -framework QuartzCore \
             -framework Metal \
-            -install_name "/Library/MobileSubstrate/DynamicLibraries/BedrockRenderScale.dylib" \
-            bedrock-render-scale/Tweak.m \
-            -o build/BedrockRenderScale.dylib
+            -framework UIKit \
+            -install_name "$INSTALL_NAME" \
+            "$SOURCE" \
+            -o "$OUTPUT"
 
+          echo "=== mode ==="
+          echo "$MODE"
           echo "=== file ==="
-          file build/BedrockRenderScale.dylib
+          file "$OUTPUT"
           echo "=== linked libraries ==="
-          otool -L build/BedrockRenderScale.dylib
+          otool -L "$OUTPUT"
           echo "=== load commands ==="
-          otool -l build/BedrockRenderScale.dylib | egrep -A6 'LC_ID_DYLIB|LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS|LC_CODE_SIGNATURE' || true
+          otool -l "$OUTPUT" | egrep -A6 'LC_ID_DYLIB|LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS|LC_CODE_SIGNATURE' || true
 
           echo "=== signature check (expected unsigned) ==="
-          codesign -dv build/BedrockRenderScale.dylib && exit 1 || true
+          codesign -dv "$OUTPUT" && exit 1 || true
+
+          if [[ "$MODE" == "probe" ]]; then
+            echo "ARTIFACT_NAME=BedrockRenderProbe-unsigned" >> "$GITHUB_ENV"
+            echo "ARTIFACT_PATH=$OUTPUT" >> "$GITHUB_ENV"
+          else
+            echo "ARTIFACT_NAME=BedrockRenderScale-${SCALE}-unsigned" >> "$GITHUB_ENV"
+            echo "ARTIFACT_PATH=$OUTPUT" >> "$GITHUB_ENV"
+          fi
 
       - name: Upload unsigned dylib
         uses: actions/upload-artifact@v4
         with:
-          name: BedrockRenderScale-${{ github.event.inputs.scale }}-unsigned
-          path: build/BedrockRenderScale.dylib
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_PATH }}
           if-no-files-found: error
